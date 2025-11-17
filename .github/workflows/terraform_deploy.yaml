@@ -1,0 +1,128 @@
+name: Terraform Multi-Account Secure CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  terraform-deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - env: dev
+            TERRAFORM_PATH: infrastructure/dev
+            TFVARS_FILE: dev.tfvars
+            AWS_ACCESS_KEY_NAME: AWS_DEV_ACCESS_KEY_ID
+            AWS_SECRET_KEY_NAME: AWS_DEV_SECRET_ACCESS_KEY
+
+          - env: stage
+            TERRAFORM_PATH: infrastructure/stage
+            TFVARS_FILE: stage.tfvars
+            AWS_ACCESS_KEY_NAME: AWS_STAGE_ACCESS_KEY_ID
+            AWS_SECRET_KEY_NAME: AWS_STAGE_SECRET_ACCESS_KEY
+
+          - env: prod
+            TERRAFORM_PATH: infrastructure/prod
+            TFVARS_FILE: prod.tfvars
+            AWS_ACCESS_KEY_NAME: AWS_PROD_ACCESS_KEY_ID
+            AWS_SECRET_KEY_NAME: AWS_PROD_SECRET_ACCESS_KEY
+
+    environment:
+      name: ${{ matrix.env }}
+      url: https://dashboard.example.com/${{ matrix.env }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.6
+
+      - name: Log Deployment Metadata
+        run: |
+          echo "Deploying to ${{ matrix.env }}"
+          echo "Using TFVARS: ${{ matrix.TFVARS_FILE }}"
+          echo "Working directory: ${{ matrix.TERRAFORM_PATH }}"
+
+      - name: Configure AWS Credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.AWS_ACCESS_KEY_NAME] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.AWS_SECRET_KEY_NAME] }}
+        run: echo "AWS credentials configured for ${{ matrix.env }}"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=${{ matrix.env }}.tfstate"
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name:  Backup Terraform State
+        run: |
+          if [ -f terraform.tfstate ]; then
+            cp terraform.tfstate terraform.tfstate.backup
+          fi
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name:  Terraform Plan
+        run: terraform plan -out=tfplan.binary -var-file=${{ matrix.TFVARS_FILE }}
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Convert Plan to JSON
+        run: terraform show -json tfplan.binary > tfplan.json
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: tfsec Scan
+        run: tfsec ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Checkov Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ matrix.TERRAFORM_PATH }}
+          quiet: true
+
+      - name: Terraform Compliance
+        run: |
+          pip install terraform-compliance
+          terraform-compliance -p tfplan.json -f ../../features
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Terraform Apply
+        id: apply
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.AWS_ACCESS_KEY_NAME] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.AWS_SECRET_KEY_NAME] }}
+        run: terraform apply -auto-approve -var-file=${{ matrix.TFVARS_FILE }}
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Rollback on Failure
+        if: failure() && steps.apply.outcome == 'failure'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.AWS_ACCESS_KEY_NAME] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.AWS_SECRET_KEY_NAME] }}
+        run: |
+          echo " Apply failed. Attempting rollback..."
+          if [ -f terraform.tfstate.backup ]; then
+            cp terraform.tfstate.backup terraform.tfstate
+            terraform apply -auto-approve -var-file=${{ matrix.TFVARS_FILE }}
+          else
+            echo "❌ No backup state found. Manual intervention required."
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Output ASG Name
+        run: terraform output -json | jq '.asg_name'
+        working-directory: ${{ matrix.TERRAFORM_PATH }}
+
+      - name: Confirm ASG Exists in AWS
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[matrix.AWS_ACCESS_KEY_NAME] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[matrix.AWS_SECRET_KEY_NAME] }}
+        run: |
+          aws autoscaling describe-auto-scaling-groups \
+            --region eu-west-1 \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-asg')].AutoScalingGroupName"
