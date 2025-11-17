@@ -111,7 +111,7 @@ jobs:
             cp terraform.tfstate.backup terraform.tfstate
             terraform apply -auto-approve -var-file=${{ matrix.TFVARS_FILE }}
           else
-            echo "❌ No backup state found. Manual intervention required."
+            echo "No backup state found. Manual intervention required."
         working-directory: ${{ matrix.TERRAFORM_PATH }}
 
       - name: Output ASG Name
