@@ -1,0 +1,89 @@
+name: Terraform Gated Production Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform-prod:
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://dashboard.example.com/prod
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC if used
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.6
+
+      - name: Configure AWS Credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_PROD_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PROD_SECRET_ACCESS_KEY }}
+        run: echo "AWS credentials configured for prod"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=prod.tfstate"
+        working-directory: infrastructure/prod
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: infrastructure/prod
+
+      - name: Backup Terraform State
+        run: |
+          if [ -f terraform.tfstate ]; then
+            cp terraform.tfstate terraform.tfstate.backup
+          fi
+        working-directory: infrastructure/prod
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan.binary -var-file=prod.tfvars
+        working-directory: infrastructure/prod
+
+      - name: Convert Plan to JSON
+        run: terraform show -json tfplan.binary > tfplan.json
+        working-directory: infrastructure/prod
+
+      - name: tfsec Scan
+        run: tfsec infrastructure/prod
+
+      - name: Checkov Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infrastructure/prod
+          quiet: true
+
+      - name: Terraform Compliance
+        run: |
+          pip install terraform-compliance
+          terraform-compliance -p tfplan.json -f ../../features
+        working-directory: infrastructure/prod
+
+      - name: Terraform Apply (Gated)
+        id: apply
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_PROD_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PROD_SECRET_ACCESS_KEY }}
+        run: terraform apply -auto-approve -var-file=prod.tfvars
+        working-directory: infrastructure/prod
+
+      - name: Rollback on Failure
+        if: failure() && steps.apply.outcome == 'failure'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_PROD_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PROD_SECRET_ACCESS_KEY }}
+        run: |
+          echo "Apply failed. Attempting rollback..."
+          if [ -f terraform.tfstate.backup ]; then
+            cp terraform.tfstate.backup terraform.tfstate
+            terraform apply -auto-approve -var-file=prod.tfvars
+          else
+            echo "No backup state found. Manual intervention required."
+        working-directory: infrastructure/prod
