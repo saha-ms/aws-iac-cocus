@@ -1,6 +1,6 @@
 provider "aws" {
-  region  = "eu-west-1"
-  profile = "dev"
+  region = "eu-west-1"
+  # profile = "dev"  # optional, only if you have a CLI profile
 }
 
 module "vpc" {
